@@ -9,7 +9,6 @@ from __future__ import annotations
 import copy
 import glob
 import io
-import inspect
 import math
 import os
 import random
@@ -56,17 +55,22 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 128))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 6))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 3))
-    model_dim = int(os.environ.get("MODEL_DIM", 384))
-    num_heads = int(os.environ.get("NUM_HEADS", 6))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    num_loops = int(os.environ.get("NUM_LOOPS", 1))
+    lora_rank = int(os.environ.get("LORA_RANK", 0))
+    qat = bool(int(os.environ.get("QAT", "1")))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -85,10 +89,8 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    lora_lr = float(os.environ.get("LORA_LR", 0.01))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    enable_compile = bool(int(os.environ.get("ENABLE_COMPILE", "1")))
-    compile_mode = os.environ.get("COMPILE_MODE", "default")
-    compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -259,7 +261,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(**autocast_kwargs()):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -510,11 +512,51 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def fake_quantize_int8_per_row(w: Tensor) -> Tensor:
+    """Simulate per-row int8 quantization with straight-through estimator.
+
+    Forward: uses quantized-then-dequantized weights (same rounding as post-training).
+    Backward: gradients pass through as if no quantization happened (STE).
+    """
+    scale = w.detach().abs().amax(dim=-1, keepdim=True).div_(127.0).clamp_(min=1.0 / 127.0)
+    w_deq = (w / scale).round().clamp_(-127, 127) * scale
+    return w + (w_deq - w).detach()
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    _qat: bool = False
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight
+        if self._qat and self.training:
+            w = fake_quantize_int8_per_row(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
+
+
+class AttentionLoRA(nn.Module):
+    """Per-iteration LoRA adapters for attention Q, K, V, and output projections.
+
+    Initialized so that the LoRA contribution is zero at the start of training
+    (B matrices are zeros). During training, the optimizer learns per-iteration
+    specialization while the base attention weights remain shared across loops.
+    """
+    def __init__(self, dim: int, kv_dim: int, rank: int):
+        super().__init__()
+        self.q_A = nn.Parameter(torch.empty(dim, rank))
+        self.q_B = nn.Parameter(torch.zeros(rank, dim))
+        self.k_A = nn.Parameter(torch.empty(dim, rank))
+        self.k_B = nn.Parameter(torch.zeros(rank, kv_dim))
+        self.v_A = nn.Parameter(torch.empty(dim, rank))
+        self.v_B = nn.Parameter(torch.zeros(rank, kv_dim))
+        self.proj_A = nn.Parameter(torch.empty(dim, rank))
+        self.proj_B = nn.Parameter(torch.zeros(rank, dim))
+        self._init_lora()
+
+    def _init_lora(self) -> None:
+        for name in ("q_A", "k_A", "v_A", "proj_A"):
+            nn.init.kaiming_uniform_(getattr(self, name), a=math.sqrt(5))
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -584,11 +626,20 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, lora: AttentionLoRA | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+        q = self.c_q(x)
+        k = self.c_k(x)
+        v = self.c_v(x)
+        if lora is not None:
+            # LoRA delta: (bsz, seqlen, dim) @ (dim, rank) @ (rank, out_dim)
+            # autocast handles fp32->bf16 cast of LoRA params automatically
+            q = q + (x @ lora.q_A) @ lora.q_B
+            k = k + (x @ lora.k_A) @ lora.k_B
+            v = v + (x @ lora.v_A) @ lora.v_B
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -604,7 +655,10 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        out = self.proj(y)
+        if lora is not None:
+            out = out + (y @ lora.proj_A) @ lora.proj_B
+        return out
 
 
 class MLP(nn.Module):
@@ -640,10 +694,10 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, lora: AttentionLoRA | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), lora=lora)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -663,6 +717,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        num_loops: int = 1,
+        lora_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -670,9 +726,12 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_unique_layers = num_layers
+        self.num_loops = num_loops
+        effective_depth = num_layers * num_loops
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_encoder_layers = effective_depth // 2
+        self.num_decoder_layers = effective_depth - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -688,6 +747,20 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        # Per-(loop, block) LoRA adapters for attention projections.
+        # Only created when num_loops > 1 and lora_rank > 0.
+        kv_dim = num_kv_heads * (model_dim // num_heads)
+        if lora_rank > 0 and num_loops > 1:
+            self.lora_adapters = nn.ModuleList(
+                [
+                    nn.ModuleList(
+                        [AttentionLoRA(model_dim, kv_dim, lora_rank) for _ in range(num_layers)]
+                    )
+                    for _ in range(num_loops)
+                ]
+            )
+        else:
+            self.lora_adapters = None
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -707,14 +780,21 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        # Iterate through effective layers: each unique block is reused across loops.
+        # First half (encoder) stores skip connections; second half (decoder) pops them.
+        eff_idx = 0
+        for loop_idx in range(self.num_loops):
+            for block_idx in range(self.num_unique_layers):
+                lora = self.lora_adapters[loop_idx][block_idx] if self.lora_adapters is not None else None
+                if eff_idx < self.num_encoder_layers:
+                    x = self.blocks[block_idx](x, x0, lora=lora)
+                    skips.append(x)
+                else:
+                    dec_idx = eff_idx - self.num_encoder_layers
+                    if dec_idx < self.num_skip_weights and skips:
+                        x = x + self.skip_weights[dec_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                    x = self.blocks[block_idx](x, x0, lora=lora)
+                eff_idx += 1
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -727,75 +807,128 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
-
-def is_rocm_build() -> bool:
-    return getattr(torch.version, "hip", None) is not None
-
-
-def accelerator_name() -> str:
-    return "rocm" if is_rocm_build() else "cuda"
-
-
-def autocast_kwargs() -> dict[str, object]:
-    # ROCm uses the CUDA device type in PyTorch autocast APIs.
-    return {"device_type": "cuda", "dtype": torch.bfloat16, "enabled": True}
-
-
-def maybe_enable_sdp_backends(log0) -> str:
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-
-    cudnn_enabled = False
-    flash_enabled = False
-    mem_efficient_enabled = False
-    math_enabled = False
-
-    enable_cudnn_sdp(False)
-    enable_mem_efficient_sdp(False)
-
-    flash_available_fn = getattr(torch.backends.cuda, "is_flash_attention_available", None)
-    flash_available = bool(flash_available_fn()) if callable(flash_available_fn) else False
-    if flash_available:
-        enable_flash_sdp(True)
-        flash_enabled = True
-    else:
-        enable_flash_sdp(False)
-        enable_math_sdp(True)
-        math_enabled = True
-
-    msg = (
-        f"sdp_backends:cudnn={cudnn_enabled} flash={flash_enabled} "
-        f"mem_efficient={mem_efficient_enabled} math={math_enabled}"
-    )
-    log0(msg)
-    return msg
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        """Return logits (bsz, seq_len, vocab) without computing loss."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        eff_idx = 0
+        for loop_idx in range(self.num_loops):
+            for block_idx in range(self.num_unique_layers):
+                lora = self.lora_adapters[loop_idx][block_idx] if self.lora_adapters is not None else None
+                if eff_idx < self.num_encoder_layers:
+                    x = self.blocks[block_idx](x, x0, lora=lora)
+                    skips.append(x)
+                else:
+                    dec_idx = eff_idx - self.num_encoder_layers
+                    if dec_idx < self.num_skip_weights and skips:
+                        x = x + self.skip_weights[dec_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                    x = self.blocks[block_idx](x, x0, lora=lora)
+                eff_idx += 1
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
 
-def make_adam(params, lr: float, beta1: float, beta2: float, eps: float) -> torch.optim.Optimizer:
-    kwargs = {"betas": (beta1, beta2), "eps": eps}
-    if "fused" in inspect.signature(torch.optim.Adam).parameters and torch.cuda.is_available():
-        kwargs["fused"] = True
-    return torch.optim.Adam([{"params": params, "lr": lr, "base_lr": lr}], **kwargs)
+def eval_val_sliding(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    batch_seqs: int = 32,
+) -> tuple[float, float]:
+    """Sliding window evaluation: each token scored with maximum context.
 
+    Windows of train_seq_len advance by `stride`. Only the last `stride` tokens
+    per window contribute to the score (first window scores all). Windows are
+    batched and distributed across ranks.
+    """
+    seq_len = args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
 
-def maybe_compile_module(module: nn.Module, args: Hyperparameters, log0) -> nn.Module:
-    if not args.enable_compile:
-        log0("torch_compile:disabled")
-        return module
-    try:
-        compiled = torch.compile(
-            module,
-            dynamic=False,
-            fullgraph=args.compile_fullgraph,
-            mode=args.compile_mode,
-        )
-    except Exception as exc:
-        log0(f"torch_compile:failed fallback=eager reason={type(exc).__name__}:{exc}")
-        return module
-    log0(
-        f"torch_compile:enabled accelerator={accelerator_name()} "
-        f"mode={args.compile_mode} fullgraph={args.compile_fullgraph}"
-    )
-    return compiled
+    # Build windows; include final partial window if it has at least 1 token
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= 1]
+    total_windows = len(window_starts)
+
+    # Distribute across ranks
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_s:my_e]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    base_model.eval()
+    with torch.inference_mode():
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens: list[int] = []
+
+            for i, ws in enumerate(batch_ws):
+                end = min(ws + seq_len, total_tokens)
+                wlen = end - ws
+                wlens.append(wlen)
+                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = base_model.forward_logits(x_batch)
+
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, seq_len)
+
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else max(wlen - stride, 0)
+                scored_nll = nll[i, s:wlen].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(wlen - s)
+                tgt = y_batch[i, s:wlen]
+                prev = x_batch[i, s:wlen]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
+
+            # Progress (rank 0 only)
+            if rank == 0 and (bi // batch_seqs) % 50 == 0:
+                done = min(bi + batch_seqs, len(my_windows))
+                pct = done / len(my_windows) * 100
+                running_bpb = 0.0
+                if token_count.item() > 0:
+                    rl = (loss_sum / token_count).item()
+                    running_bpb = rl / math.log(2.0) * (token_count.item() / byte_count.item())
+                print(f"  sliding_eval [{pct:5.1f}%] {done}/{len(my_windows)} windows running_bpb={running_bpb:.6f}", flush=True)
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    base_model.train()
+    return val_loss, bits_per_token * tokens_per_byte
 
 
 # -----------------------------
@@ -807,10 +940,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-#    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
-    # DISTRIBUTED + ACCELERATOR SETUP
+    # DISTRIBUTED + CUDA SETUP
     # -----------------------------
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -824,7 +957,7 @@ def main() -> None:
     grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
-        raise RuntimeError("A CUDA-compatible accelerator is required; ROCm builds also appear via torch.cuda")
+        raise RuntimeError("CUDA is required")
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
@@ -835,6 +968,12 @@ def main() -> None:
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+
+    enable_cudnn_sdp(False)
+    enable_flash_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -855,17 +994,11 @@ def main() -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(f"Accelerator backend: {accelerator_name()}", console=False)
     log0(
-        (
-            subprocess.run(["amd-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout
-            if is_rocm_build()
-            else subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout
-        ),
+        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
         console=False,
     )
     log0("=" * 100, console=False)
-    maybe_enable_sdp_backends(log0)
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -909,12 +1042,17 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        num_loops=args.num_loops,
+        lora_rank=args.lora_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, AttentionLoRA)):
             module.float()
+        if isinstance(module, CastedLinear) and args.qat:
+            module._qat = True
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = maybe_compile_module(base_model, args, log0)
+    log0(f"qat:{args.qat}")
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -936,7 +1074,12 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = make_adam([base_model.tok_emb.weight], token_lr, args.beta1, args.beta2, args.adam_eps)
+    optimizer_tok = torch.optim.Adam(
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
@@ -945,15 +1088,37 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = make_adam(scalar_params, args.scalar_lr, args.beta1, args.beta2, args.adam_eps)
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.lora_adapters is not None:
+        lora_params = list(base_model.lora_adapters.parameters())
+        optimizer_lora = torch.optim.Adam(
+            [{"params": lora_params, "lr": args.lora_lr, "base_lr": args.lora_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_lora)
     if base_model.lm_head is not None:
-        optimizer_head = make_adam([base_model.lm_head.weight], args.head_lr, args.beta1, args.beta2, args.adam_eps)
+        optimizer_head = torch.optim.Adam(
+            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params}")
+    n_lora = sum(p.numel() for p in base_model.lora_adapters.parameters()) if base_model.lora_adapters is not None else 0
+    effective_depth = args.num_layers * args.num_loops
+    log0(f"model_params:{n_params} (unique_layers:{args.num_layers} loops:{args.num_loops} effective_depth:{effective_depth} lora_rank:{args.lora_rank} lora_params:{n_lora})")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -1002,7 +1167,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(**autocast_kwargs()):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1070,7 +1235,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(**autocast_kwargs()):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -1157,18 +1322,35 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
+    if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
+        log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
+        q_val_loss, q_val_bpb = eval_val_sliding(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            stride=args.eval_stride,
+            batch_seqs=args.eval_batch_seqs,
+        )
+    else:
+        log0("final_eval_mode:standard")
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "

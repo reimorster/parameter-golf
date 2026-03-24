@@ -1,7 +1,7 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from __future__ import annotations
 import copy
 import glob
 import io
-import inspect
 import math
 import os
 import random
@@ -31,11 +30,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
+# Default Training Opt Seq4096 v1 run:
 # - 9 transformer blocks at width 512
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+# - vocab size 1024, sequence length 4096, tied embeddings
+# - 393,216 train tokens per step (3/4 batch) for 20,000 iterations with a ~10 minute cap
+# - tuned Muon optimizer: momentum 0.99, lower LR (0.020/0.020/0.030), warmdown 3000
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -43,7 +43,7 @@ class Hyperparameters:
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
-    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    run_id = os.environ.get("RUN_ID", "training_opt_seq4096_v1")
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
@@ -53,19 +53,19 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 128))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 6))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 3))
-    model_dim = int(os.environ.get("MODEL_DIM", 384))
-    num_heads = int(os.environ.get("NUM_HEADS", 6))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -74,21 +74,18 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.030))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.020))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.020))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    enable_compile = bool(int(os.environ.get("ENABLE_COMPILE", "1")))
-    compile_mode = os.environ.get("COMPILE_MODE", "default")
-    compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -259,7 +256,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(**autocast_kwargs()):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -586,9 +583,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -728,76 +725,6 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
-def is_rocm_build() -> bool:
-    return getattr(torch.version, "hip", None) is not None
-
-
-def accelerator_name() -> str:
-    return "rocm" if is_rocm_build() else "cuda"
-
-
-def autocast_kwargs() -> dict[str, object]:
-    # ROCm uses the CUDA device type in PyTorch autocast APIs.
-    return {"device_type": "cuda", "dtype": torch.bfloat16, "enabled": True}
-
-
-def maybe_enable_sdp_backends(log0) -> str:
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-
-    cudnn_enabled = False
-    flash_enabled = False
-    mem_efficient_enabled = False
-    math_enabled = False
-
-    enable_cudnn_sdp(False)
-    enable_mem_efficient_sdp(False)
-
-    flash_available_fn = getattr(torch.backends.cuda, "is_flash_attention_available", None)
-    flash_available = bool(flash_available_fn()) if callable(flash_available_fn) else False
-    if flash_available:
-        enable_flash_sdp(True)
-        flash_enabled = True
-    else:
-        enable_flash_sdp(False)
-        enable_math_sdp(True)
-        math_enabled = True
-
-    msg = (
-        f"sdp_backends:cudnn={cudnn_enabled} flash={flash_enabled} "
-        f"mem_efficient={mem_efficient_enabled} math={math_enabled}"
-    )
-    log0(msg)
-    return msg
-
-
-def make_adam(params, lr: float, beta1: float, beta2: float, eps: float) -> torch.optim.Optimizer:
-    kwargs = {"betas": (beta1, beta2), "eps": eps}
-    if "fused" in inspect.signature(torch.optim.Adam).parameters and torch.cuda.is_available():
-        kwargs["fused"] = True
-    return torch.optim.Adam([{"params": params, "lr": lr, "base_lr": lr}], **kwargs)
-
-
-def maybe_compile_module(module: nn.Module, args: Hyperparameters, log0) -> nn.Module:
-    if not args.enable_compile:
-        log0("torch_compile:disabled")
-        return module
-    try:
-        compiled = torch.compile(
-            module,
-            dynamic=False,
-            fullgraph=args.compile_fullgraph,
-            mode=args.compile_mode,
-        )
-    except Exception as exc:
-        log0(f"torch_compile:failed fallback=eager reason={type(exc).__name__}:{exc}")
-        return module
-    log0(
-        f"torch_compile:enabled accelerator={accelerator_name()} "
-        f"mode={args.compile_mode} fullgraph={args.compile_fullgraph}"
-    )
-    return compiled
-
-
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -807,10 +734,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-#    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
-    # DISTRIBUTED + ACCELERATOR SETUP
+    # DISTRIBUTED + CUDA SETUP
     # -----------------------------
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -824,7 +751,7 @@ def main() -> None:
     grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
-        raise RuntimeError("A CUDA-compatible accelerator is required; ROCm builds also appear via torch.cuda")
+        raise RuntimeError("CUDA is required")
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
@@ -835,6 +762,12 @@ def main() -> None:
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+
+    enable_cudnn_sdp(False)
+    enable_flash_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -855,17 +788,11 @@ def main() -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(f"Accelerator backend: {accelerator_name()}", console=False)
     log0(
-        (
-            subprocess.run(["amd-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout
-            if is_rocm_build()
-            else subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout
-        ),
+        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
         console=False,
     )
     log0("=" * 100, console=False)
-    maybe_enable_sdp_backends(log0)
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -914,7 +841,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = maybe_compile_module(base_model, args, log0)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -936,7 +863,12 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = make_adam([base_model.tok_emb.weight], token_lr, args.beta1, args.beta2, args.adam_eps)
+    optimizer_tok = torch.optim.Adam(
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
@@ -945,15 +877,26 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = make_adam(scalar_params, args.scalar_lr, args.beta1, args.beta2, args.adam_eps)
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
-        optimizer_head = make_adam([base_model.lm_head.weight], args.head_lr, args.beta1, args.beta2, args.adam_eps)
+        optimizer_head = torch.optim.Adam(
+            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -1002,7 +945,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(**autocast_kwargs()):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1070,7 +1013,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(**autocast_kwargs()):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
